@@ -118,3 +118,50 @@
     - 只要sendbuf不为空就循环发送数据，内部会调用socket的send接口讲序列化好的消息发送出去。
 - S2C
 
+  - 调用流程： CommunicatorEpoll::handleInputImp()->TC_TCPTransceiver::doResponse()->AdapterProxy::onParserCallback()->AdapterProxy::finishInvoke()->AdapterProxy::finishInvoke_serial()->CommunicatorEpoll::pushAsyncThreadQueue()->ServantProxyCallback::dispatch()->ServantProxyCallback::onDispatch()->HelloPrx::hello_callback()
+
+  - CommunicatorEpoll::handleInputImp()
+
+    - 创建adapterProxy的时候会创建的时候会创建TC_TCPTransceiver。当TC_TCPTransceiver初始化成功以后会调用oncrated回调。adapterProxy就是再这个时候绑定input、output、close事件，并将自己注册到CommunicatorEpoll的poller中的。
+    - tars使用的是et模式，当接接收缓冲区有新的数据到来时会出发input事件，从而触发handleInputImp回调。接下来消息的处理流程就开始了。
+
+  - TC_TCPTransceiver::doResponse()
+
+    - 通过socket的recv接收数据
+    - 检测发送队列，有消息就发送一哈
+    - doProtocolAnalysis进行消息的反序列化，序列化操作通过callback交给adaptorProxy处理
+
+  - AdapterProxy::onParserCallback()
+
+    - 进行消息的反序列化
+    - 调用finishInvoke
+
+  - AdapterProxy::finishInvoke()
+
+    - 根据处理方式配置决定是顺序处理还是并行处理
+    - 顺序处理调用finishInvoke_serial
+    - 并行处理调用finishInvoke_parallel
+
+  - AdapterProxy::finishInvoke_serial()
+
+    - 上文有讲过顺序处理再讲消息加入到队列的同时会记录到adaptorProxy的_requestMsg成员。
+    - 顺序处理的话，这里_requestMsg应该是个有效的值。
+    - 从超时队列中取出message。变更状态。填充response。
+    - 调用finishInvoke重载
+
+  - AdapterProxy::finishInvoke（）
+
+    - 需要区分是同不调用还是一步调用，同不调用还要区分是否是协程方式调用
+    - 协程方式调用的话再c2s阶段记录了协程id，这里通过写成id唤醒协程TC_CoroutineScheduler::put
+    - 同步方式的话，再c2s阶段创建了一个monitor并且wait再monitor上。这里只需要调用monitor的notify
+    - 如果是异步调用会将message加入到Communicator的AsyncProcThread中。这里是轮训选择一个回调线程。
+    - 回调线程wait的队列填充数据以后回进行消费，从而调用ServantProxyCallback::dispatch()
+
+  - ServantProxyCallback::dispatch()
+
+    没甚可说的，调用ondispath，ondispath是虚接口。会被helloCallback实现
+
+  - helloCallback::onDispath()
+
+    - 通过tars2cpp生成的代码，所有的回调都会根据字符串名称组合到一个数组中。根据方法的名称的偏移求出序号，从而调用对应序号的回调。
+    - 对应的回调完成的就是tars和tup协议的解析。参数的反序列化。
