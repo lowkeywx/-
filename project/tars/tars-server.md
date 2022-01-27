@@ -117,6 +117,90 @@
 
 - C2S
 
-  - 
+  - 调用流程：Epoller::done()->Epoller::fireEvent()->Connection::handleInputImp()->TC_TCPTransceiver::doResponse()->recv()->TC_Transceiver::doProtocolAnalysis()->Connection::onParserCallback()->BindAdapter::getProtocol()->BindAdapter::insertRecvQueue()->DataBuffer::insertRecvQueue()->Handle::handleOnceThread()->DataBuffer::pop()->ServantHandle::handle()->ServantHandle::handleTarsProtocol()->Servant::dispatch()->Servant::onDispatch()
 
+  - Epoller::done()
+
+    服务端的io和客户端部分的结构一样。都存在一饿TC_CoroutineScheduler，scheduler中管理epooler。scheduler::run轮训执行poller的done。关于poler的done的具体逻辑可以自行百度epoll的源码。
+
+  - Epoller::fireEvent()
+
+    当epollwait结束，将激活的事件通过fireEvent触发。
+
+  - Connection::handleInputImp()
+
+    - 新的链接建立后，会创建connection绑定socketFd。然后添加到NetThread的ConnectionList后会创建epollInfo，然后注册innput、output等事件并添加到epoller的事件循环中。
+    - tars采用的et模式，当读缓存发生变化后会出发input事件，然后出发handleInputImp回调。
+
+  - TC_TCPTransceiver::doResponse()
+
+    - tars为了缩小平台以及tcp udp的差异带来的代码冗余提供了Transceiver类。
+    - 这个类提供了重连、收发数据的功能。doResponse调用socket recv接口接收数据。
+    - 读取的数据存入_recvBuffer，并且调用doProtocolAnalysis进行协议的解析。
+
+  - Connection::onParserCallback()
+
+    - connection本身不具备协议解析的能力，tars服务端协议解析的能力由BindAdapter提供。BindAdapter的协议解析接口又Appliction初始化以后透传。
+    - 调用BindAdapter的协议解析函数的到数据以后会组装RecvContext
+    - 将RecvContext添加到DataBuffer中。
+
+  - BindAdapter::insertRecvQueue()
+
+    透传给dataBuffer
+
+  - DataBuffer::insertRecvQueue()
+
+    databuffer提供了wait和notify的能力。如果是merge模式需要通过epollInfo的notify通知poller。
+
+  - Handle::handleOnceThread()
+
+    - 前面在NetThread和handle初始化的部分有提到，handle创建时会讲BindAdapter的dataBuffer绑定到handle上面。当RecvContext添加到DataBuffer中后会通过notify通知handle线程或者通知io线程。
+    - handleOnceThread会每次从队列中获取一个RecvContext进行消费。
+
+  - ServantHandle::handle()
+
+    - 根据是否是tars协议决定调用ServantHandle::handleTarsProtocol()或者ServantHandle::handleNoTarsProtocol()
+    - 创建current绑定recvContex和sendContext
+
+  - ServantHandle::handleTarsProtocol()
+
+    调用servant的dispath，然后调用ondispath
+
+  - Servant::onDispatch()
+
+    - helloServant的代码是通过tars2Cpp生成的。所有方法基本上都是解析tart和tup协议然后反序列化参数。
+    - 打印调用信息
+    - 调用hello业务实现的接口
+    - 组装sendContext
+    - 每个接口都会存入数组中，根据名字可以求出偏移。最后在onDispath中通过序号进行分发。
+  
 - S2C
+
+  - 调用过程：Current::sendResponse()->Handle::send()->TC_EpollServer::send()->NetThread::send()->Connection::send()->TC_Transceiver::sendRequest()->TC_NetWorkBuffer::addBuffer()->socket::send()
+
+  - Current::sendResponse()
+
+    - 通过current接口绑定recvContex和sendContex
+    - 将request中的信息复制给response。例如，RequestID、vertion、调用类型等
+    - response结构的序列化tup协议头大小为4字节
+
+  - Handle::send()
+
+    - 透传给EpollServer
+    - 传递的是sendContex，这个时候response已经序列化为buff了
+
+  - TC_EpollServer::send()
+
+    - 从response中取出接受消息时绑定的bindAdapter实例。
+    - 将response数据放入到接受消息时处理数据的线程中。
+    - 会根据当前线程是否是接受消息时的线程有所差异，如果是则直接选取connection执行send。如果不是则需要先添加到发送队列中，然后，激活output事件，从而出发onOuputiml回调。
+
+  - Connection::send
+
+    - 调用TC_Transceiver::sendRequest，
+    - 如果待发送数据较多，需要先入发送队列
+
+  - socket::send()
+
+    发送数据啦
+
