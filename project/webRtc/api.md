@@ -59,11 +59,18 @@
 
 - PeerConnectionFactory::CreatePeerConnectionOrError
   - 创建cert_generator
-  - 创建allocator，端口选择器
+  - 创建allocator，端口选择器，类型为BasicPortAllocator
   - 创建async_resolver_factory，//TODO
   - 创建ice_transport_factory，//TODO
   - 创建call，//TODO
   - 通过PeerConnection::Create创建peerConnection，接受五步创建的实例作为构造参数。config主要就是turn和stun服务器的地址。
+
+- BasicPortAllocator::BasicPortAllocator
+  - 设置session_pool_size=0
+  - 调用PortAllocator::SetConfiguration，除了构造会调用，AddTurnServer和Connection的Initialize也会调用
+
+- PortAllocator::SetConfiguration
+  - 详情见下文
 
 - PeerConnection::Create
   - 创建dns解析模块
@@ -72,11 +79,65 @@
 
 - PeerConnection::Initialize
   - 解析iceconfig也就是turn和sturn服务器
+  - 调用InitializePortAllocator_n初始化PortAllocator
   - 记录configuration_
   - 构造StatsCollector，保存为成员。
   - 构造RTCStatsCollector，保存为成员。
   - 构造SdpOfferAnswerHandler，保存为成员。
   - 构造RtpTransmissionManager，保存为成员。
+
+- PeerConnection::InitializePortAllocator_n
+  - 调用PortAllocator::Initialize，内部没什么逻辑，就是设置了一个初始化状态
+  - 检查配置信息是否有效
+  - 调用PortAllocator::SetConfiguration重设PortAllocator
+
+- PortAllocator::SetConfiguration
+  - 记录stun_server到stun_servers_成员
+  - 记录turn_server到turn_servers_成员
+  - 设置turn server筛选偏好turn_port_prune_policy_
+  - 设置condidata_pool_size,对应的是PortAllocatorSession的个数
+  - 如果当前的PortAllocatorSession个数少于condidata_pool_size则通过CreateSessionInternal创建新的session对象加入到pooled_sessions_成员，如果多余则从末尾删除多的
+  - 调用BasicPortAllocatorSession::StartGettingPorts开始收集port
+  
+- BasicPortAllocatorSession::StartGettingPorts
+  - 创建socket_factory,类型为BasicPacketSocketFactory
+  - 调用BasicPortAllocatorSession::GetPortConfigurations，异步调用
+  
+- BasicPortAllocatorSession::GetPortConfigurations
+  - 根据strun和turn服务器地址创建PortConfiguration对象
+  - 调用BasicPortAllocatorSession::ConfigReady
+
+- BasicPortAllocatorSession::ConfigReady
+  - 通过network thread 异步调用BasicPortAllocatorSession::OnConfigReady
+
+- BasicPortAllocatorSession::OnConfigReady
+  - 将刚刚创建的config加入到configs成员
+  - 调用BasicPortAllocatorSession::AllocatePorts
+
+- BasicPortAllocatorSession::AllocatePorts
+  - 调用BasicPortAllocatorSession::OnAllocate
+
+- BasicPortAllocatorSession::OnAllocate
+  - 调用BasicPortAllocatorSession::DoAllocate
+  - 状态变更为allocation_started_=true
+
+- BasicPortAllocatorSession::DoAllocate
+  - 通过AllocationSequence开始收集port
+
+- AllocationSequence::Init
+  - 创建udp socket
+  - 绑定OnReadPacket回调
+
+- AllocationSequence::Start
+  - 通过network thread 异步调用AllocationSequence::Process
+
+- AllocationSequence::Process
+  - 根据阶段创建不同的socket，主要为UDPPort、stunPort、RelayPorts、TCPPorts
+  - 执行更新阶段计数，进入下一个阶段，即process自身
+  - 最终调用BasicPortAllocatorSession::AddAllocatedPort添加port
+
+- BasicPortAllocatorSession::AddAllocatedPort
+  - 
 
 - StatsCollector
   - //TODO
@@ -189,13 +250,18 @@
   - 创建各种类型的transprot，最终都交给JsepTransport统一管理和使用。
   - 屌用SdpOfferAnswerHandler::ApplyLocalDescription应用SessionDescription
   - 通过Oncuccese通知observer
-  - 开始ice的过程
+  - 通过MaybeStartGathering，主要是端口的探测以及更新ice状态。
 
 - SdpOfferAnswerHandler::ApplyLocalDescription
   - 将新创建的SessionDescription保存给pending_local_description_，然后local_description()就可以使用了。
   - 创建新的videoChannel、audioChannel、dataChannel，清理旧的channel。并将除了dataChannel之外的配置给对应的Transceiver。Transceiver保存在rtc_manager中。rtc_manager()实际使用的是PeerConnection中的。Transceiver在AddTrack的时候创建的。
+  - 调用SdpOfferAnswerHandler::PushdownTransportDescription，更新transport_controller中ice过程需要用到的信息。
   - 调用SdpOfferAnswerHandler::UpdateSessionState通知应用层，给channel和Transceiver设置SessionDescription。
-  
+
+- SdpOfferAnswerHandler::PushdownTransportDescription
+  - 根据是local还是remote决定调用JsepTransportController::SetLocalDescription，还是JsepTransportController::SetRemoteDescription
+  - 最终都会调用JsepTransportController::ApplyDescription_n
+
 - SdpOfferAnswerHandler::UpdateSessionState
   - 通过ChangeSignalingState通知应用层，没什么特别的，透传到PeerConnection->Oberser->ChangeSignalingState，通知应用层。
   - 调用PushdownMediaDescription将SessionDescription设置给channel和Transceiver。
@@ -205,5 +271,116 @@
   - 遍历所有channel，通过BaseChannel::SetLocalContent设置rtc协议的相关内容。meidia_channel中设置了rtp协议。协议的相关结构为VoiceMediaInfo和VideoMediaInfo。并且通过GetStat获取。从media_channel中通过setLocalContent设置的。
   - 根据SessionDescription中的信息，更新MediaCHannel中的成员，用于通信使用。
 
+> SdpOfferAnswerHandler中的许多功能都来自于PeerConnection。例如，transportController就是通过peerConnection类型的成员pc获得的。
+
+# 接收到信令服务器的sdp消息
+
+- PeerConnection::SetRemoteDescription
+  - 调用SdpOfferAnswerHandler::SetRemoteDescription。没啥好说的，直接透传了。
+
+- SdpOfferAnswerHandler::SetRemoteDescription
+  - 组装RemoteDescriptionOperation，SdpOfferAnswerHandler作为参数
+  - 将SdpOfferAnswerHandler::DoSetRemoteDescription加入调用链。
+
+- SdpOfferAnswerHandler::DoSetRemoteDescription
+  - 初步判断远端sdp的状态是否合法
+  - 判断RemoteDescriptionOperation是否有效
+  - 调用SdpOfferAnswerHandler::ApplyRemoteDescription
+
+- SdpOfferAnswerHandler::ApplyRemoteDescription
+  - 调用RemoteDescriptionOperation::ReplaceRemoteDescriptionAndCheckEror
+  - 调用RemoteDescriptionOperation::UpdateChannels，//TODO
+  - 调用RemoteDescriptionOperation::UpdateSessionState， //TODO
+  - 调用RemoteDescriptionOperation::UseCandidatesInRemoteDescription， //TODO
+  - 根据remote sdp中的media信息，创建stream、transceiver相关对象。
+
+- RemoteDescriptionOperation::ReplaceRemoteDescriptionAndCheckEror
+  - 调用SdpOfferAnswerHandler::ReplaceRemoteDescription，透传
+
+- SdpOfferAnswerHandler::ReplaceRemoteDescription
+  - 获取SessionDescription
+  - 调用JsepTransportController::SetRemoteDescription
+
+- JsepTransportController::SetRemoteDescription
+  - 判断当前线程是否是网络线程，如果不是，将调用转移到网络线程
+  - 调用JsepTransportController::ApplyDescription_n
+
+- JsepTransportController::ApplyDescription_n
+  - 检测bundleGroups，//TODO
+  - 根据SessionDescription中的media信息创建Transport对象，实际为遍历所有MediaDescription，且逐一调用JsepTransportController::MaybeCreateJsepTransport。
+  - 遍历所有MediaDescription，获取刚刚创建的Transport对象。
+  - 通过JsepTransportController::CreateJsepTransportDescription创建JsepTransportDescription对象
+  - 通过JsepTransport::SetRemoteJsepTransportDescription或者JsepTransport::SetLocalJsepTransportDescription设置给JsepTransport
+
+- JsepTransportController::MaybeCreateJsepTransport
+  - 调用JsepTransportController::CreateIceTransport创建P2PTransportChannel对象
+  - 根据P2PTransportChannel和mediaDescription创建DtlsTransportInternal
+  - 根据配置决定是否创建srtp_transport、sdes_transport、sctp_transport
+  - 将创建的P2PTransportChannel和各种transport对象交给JsepTransport
+  - 将创建的JsepTransport注册进transports中
+
+- JsepTransportController::CreateIceTransport
+  - 调用ice_transport_factory的CreateIceTransport，创建P2PTransportChannel对象
+
+- JsepTransportController::CreateJsepTransportDescription
+  - 创建JsepTransportDescription对象，该对象封装了TransportDescription，而TransportDescription就是ice相关的信息，包括iecpwd、iceMode、connection_Role等。
+
+- JsepTransport::SetRemoteJsepTransportDescription
+  - 将JsepDescription设置给remote_description_成员
+  - 将提取的ice信息设置给各种transport对象，例如：通过JsepTransport::SetRemoteIceParameters设置给ice_transport、通过NegotiateAndSetDtlsParameters设置给其他transport对象。
+
+- JsepTransport::SetLocalJsepTransportDescription
+  - 同SetRemoteJsepTransportDescription类似
+
+# add ice condidate
+
+- PeerConnection::AddIceCandidate
+  - 调用SdpOfferAnswerHandler::AddIceCandidate，直接透传
+
+- SdpOfferAnswerHandler::AddIceCandidate
+  - 根据参数决定调用版本，最终都会调用 SdpOfferAnswerHandler::AddIceCandidateInternal
+
+- SdpOfferAnswerHandler::AddIceCandidateInternal
+  - 调用SdpOfferAnswerHandler::ReadyToUseRemoteCandidate，检测是否已经保存了该ice_condidate
+  - 将新的ice condidate添加到pedding_remote_description中
+  - 调用SdpOfferAnswerHandler::UseCandidate
+
+- SdpOfferAnswerHandler::UseCandidate
+  - 再次检测condidate
+  - 调用PeerConnection::AddRemoteCandidate
+
+- PeerConnection::AddRemoteCandidate
+  - 组装任务，添加到任务队列
+  - 组装的任务为：调用JsepTransportController::AddRemoteCandidates
+
+- JsepTransportController::AddRemoteCandidates
+  - 根据sdp中的media id确定一个Transport，每个媒体类型都会有一个对应的transport
+  - 调用JsepTransport::AddRemoteCandidates
+
+- JsepTransport::AddRemoteCandidates
+  - 遍历所有condidate，调用transport所管理的transport的AddRemoteCandidate，即P2PTransportChannel::AddRemoteCandidate
+
+- P2PTransportChannel::AddRemoteCandidate
+  - 如果是域名需要解析ip地址，调用ResolveHostnameCandidate获得最终的ip，异步调用，获取最终的ip地址
+  - 调用P2PTransportChannel::FinishAddingRemoteCandidate
+
+- P2PTransportChannel::FinishAddingRemoteCandidate
+  - 如果已经创建过connection，需要更新connection中的remote_candidate
+  - 调用P2PTransportChannel::CreateConnections创建connections
+
+- P2PTransportChannel::CreateConnections
+  - 遍历之前MaybeStartGathering中探测的端口，逐一调用P2PTransportChannel::CreateConnection
+  - 需要根据探测的端口会和session绑定，session通过AddAllocatorSession添加到allocat_sessions中，类型为FakePortAllocatorSession。session_pool中没有可用session的时候才会创建。
+  - session用来创建获取可用的port对象。
+
+- P2PTransportChannel::CreateConnection
+  - port对象中维护多个connection
+  - 从port中获取一个connection，如果没有空闲的就创建一个新的。
+  - 调用P2PTransportChannel::AddConnection，设置connection的基本信息，并且添加到ice_controller中
+
+- P2PTransportChannel::AddConnection
+  - 设置ice的超时时间等信息
+  - 绑定回调
+  - 通过调用BasicIceController::AddConnection添加到connections成员中，之后会选取最有的connection
 
 
