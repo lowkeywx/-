@@ -28,6 +28,7 @@
 - PeerConnectionFactory::Create
   - 通过ConnectionContext::Create创建ConnectionContext。将CreatePeerConnectionFactory的所有参数交给ConnectionContext管理。
   - 将刚刚创建的context和CreatePeerConnectionFactory的参数交给PeerConnectionFactory实例。
+  - 如果没有创建work_thread、network_thread、signaling_thread则在初始化ConnectionContex的时候创建，类型为thread。
 
 - ConnectionContext::Create
   - 启动network_thread_、worker_thread_、signaling_thread_
@@ -100,7 +101,7 @@
   - 调用BasicPortAllocatorSession::StartGettingPorts开始收集port
   
 - BasicPortAllocatorSession::StartGettingPorts
-  - 创建socket_factory,类型为BasicPacketSocketFactory
+  - 创建socket_factory,类型为BasicPacketSocketFactory,BasicPacketSocketFactory需要一个SocketServer来自于networkthread。networkthread维护epoll，出发socket事件。
   - 调用BasicPortAllocatorSession::GetPortConfigurations，异步调用
   
 - BasicPortAllocatorSession::GetPortConfigurations
@@ -137,7 +138,9 @@
   - 最终调用BasicPortAllocatorSession::AddAllocatedPort添加port
 
 - BasicPortAllocatorSession::AddAllocatedPort
-  - 
+  - 设置port的属性
+  - 加入到ports
+  - 绑定OnCandidateReady、OnPortComplete等回调
 
 - StatsCollector
   - //TODO
@@ -332,7 +335,7 @@
 - JsepTransport::SetLocalJsepTransportDescription
   - 同SetRemoteJsepTransportDescription类似
 
-# add ice condidate
+# add remote ice condidate
 
 - PeerConnection::AddIceCandidate
   - 调用SdpOfferAnswerHandler::AddIceCandidate，直接透传
@@ -382,5 +385,97 @@
   - 设置ice的超时时间等信息
   - 绑定回调
   - 通过调用BasicIceController::AddConnection添加到connections成员中，之后会选取最有的connection
+  - 这里没太看明白，以后分析。 //TODO
+
+# 本地condidate收集过程
+
+- StunBindingRequest::OnResponse
+  - 从response中解析address
+  - 创建SocketAddress对象，并通过回调UDPPort::OnStunBindingRequestSucceeded通知port
+
+- UDPPort::OnStunBindingRequestSucceeded
+  - 保存成功通信的stun服务器地址
+  - 保存turn地址，一边p2p失败的时候使用
+  - 调用Port::AddAddress，通知session
+
+- Port::AddAddress
+  - 组装Candidate
+  - 调用Port::FinishAddingAddress，传入刚刚创建的condidate
+
+- Port::FinishAddingAddress
+  - 保存收集到的condidate
+  - 通过SignalCandidateReady通知上层，BasicPortAllocatorSession::OnCandidateReady
+
+- BasicPortAllocatorSession::OnCandidateReady
+  - 通过SignalCandidatesReady通知上层
+  - MaybeSignalCandidatesAllocationDone
+
+- P2PTransportChannel::OnCandidatesReady
+  - 将所有的condidate通过SignalCandidateGathered通知上层
+
+- JsepTransportController::OnTransportCandidateGathered_n
+  - 通过signal_ice_candidates_gathered_通知上层
+  - 通过SubscribeIceCandidateGathered绑定的回调PeerConnection::OnTransportControllerCandidatesGathered
+
+- PeerConnection::OnTransportControllerCandidatesGathered
+  - 组装成JsepIceCandidate
+  - 通过SdpOfferAnswerHandler::AddLocalIceCandidate记录下来，并且会更新session description中的信息
+  - 通过OnIceCandidate通知observer，其实就是应用层，收到以后通过信令服务器发送到对端，对端再通过addIceCondidate设置
+
+# p2p链接建立过程
+- 创建PeerConnection
+- 创建BasicPortAllocator
+- 创建BasicPortAllocatorSession加入session pool
+- 创建UdpPort、TurnPort、StunPort、TcpPort等
+- 创建StunPort的同时触发SendStunBindingRequests，发送stun探测消息
+- 收到stun服务器的回复，触发socket的读事件，进而触发Udp的OnReadPacket。
+- 触发StunBindingRequest::OnResponse剩余参考**本地condidate收集过程**
+- 通过信令服务器发送到对断
+- 接受到远端Condidate，通过addIceCondatate设置到
+- 剩余参考**add remote ice condidate**
+- 然后会选择一个connection，发送sturn request出发远端的HandleStunBindingOrGoogPingRequest
+- 通过SendStunBindingResponse发送response
+- 触发connection的OnReadPacket回调
+- 触发Connection::HandleStunBindingOrGoogPingRequest
+- 回复response
+- 远端出发OnReadPacket
+- 触发Connection的OnReadPacket
+- 触发SignalStateChange和SignalNominated回调。两者都会出发connection重拍的动作。即P2PTransportChannel::RequestSortAndStateUpdate
+
+# 流的启动
+
+- stream的启动时跟随sdp的创建和接受自动进行的。
+- 对于流的一些控制主要是通过WebRtcVoiceMediaChannel，通过ssrc精准控制是哪一个流。
+- SdpOfferAnswerHandler::PushdownMediaDescription控制流的创建与启动
+- ApplyLocalDescription时本地流创建，同时会检查时候创建了频道，如果没有创建会创建channel
+- ApplyRemoteDescription时远端流创建。
+
+# 音频数据流香
+- WebRtcAudioSendStream继承自sink，Source通过sink的Ondata传递数据
+
+- WebRtcAudioSendStream::OnData
+  - 创建AudioFrame，并通过UpdateFrame接口更新audio数据和一些属性
+  - 调用AudioSendStream::SendAudioData处理数据
+  - 此处的Source是track，已经是处理完的数据了，就剩下encode和send了
+
+- WebRtcAudioSendStream中Source来源
+  - WebRtcVoiceMediaChannel::SetLocalSource
+  - WebRtcVoiceMediaChannel::SetAudioSend
+  - AudioRtpSender::SetSend中的sink_adapter_
+  - RtpSenderBase::SetTrack
+  - RtpTransmissionManager::AddTrackUnifiedPlan或者RtpTransmissionManager::CreateSender
+  - 来源都是RtpTransmissionManager::AddTrack
+  - PeerConnection::AddTrack
+
+- 采集数据流香
+  - AudioProcessingImpl::ProcessCaptureStreamLocked调用处理aec、agc等
+  - AudioProcessingImpl::ProcessStream
+  - audio_frame_proxies文件中的ProcessAudioFrame
+  - AudioTransportImpl::ProcessCaptureFrame
+  - AudioTransportImpl::RecordedDataIsAvailable，完成了音频数据的process和SendAudioData
+  - AudioDeviceBuffer::DeliverRecordedData
+  - AudioDeviceWindowsCore::StartRecording采集音频，调用SetRecordedBuffer传递音频数据。
+  - WebRtcVoiceEngine::Init创建AudioDeviceModule实例
+  - 创建AudioDeviceModule实例的时候会创建AudioDeviceModuleImpl和AudioDeviceBuffer并讲buffer绑定到AudioDeviceModuleImpl的成员AudioDeviceWindowsCore中。
 
 
