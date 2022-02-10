@@ -450,7 +450,7 @@
 - ApplyLocalDescription时本地流创建，同时会检查时候创建了频道，如果没有创建会创建channel
 - ApplyRemoteDescription时远端流创建。
 
-# 音频数据流香
+# 音频数据流向
 - WebRtcAudioSendStream继承自sink，Source通过sink的Ondata传递数据
 
 - WebRtcAudioSendStream::OnData
@@ -467,7 +467,7 @@
   - 来源都是RtpTransmissionManager::AddTrack
   - PeerConnection::AddTrack
 
-- 采集数据流香
+- 采集数据流向
   - AudioProcessingImpl::ProcessCaptureStreamLocked调用处理aec、agc等
   - AudioProcessingImpl::ProcessStream
   - audio_frame_proxies文件中的ProcessAudioFrame
@@ -478,4 +478,28 @@
   - WebRtcVoiceEngine::Init创建AudioDeviceModule实例
   - 创建AudioDeviceModule实例的时候会创建AudioDeviceModuleImpl和AudioDeviceBuffer并讲buffer绑定到AudioDeviceModuleImpl的成员AudioDeviceWindowsCore中。
 
+# channel创建流程
+- ApplyLocalDescription中创建本地通过channel_manager创建voic channel
+- 通过CreateMediaChannel创建media channel
+- 将创建的media channel加入到VoiceChannel中
+
+> ChannelManager管理的是VoiceChannel和VideoChannel，两者都继承自BaseChannel，且管理各自的MediaChannel和StreamParams。真正的流对象类型为WebRtcVideoReceiveStream和WebRtcAudioSendStream。通过MediaChannel的AddSendStream添加，并将params转化为实际的流对象。MediaChannel控制流的启动和停止等细节。
+
+# stream创建流程
+- ApplyLocalDescription的时候回通过UpdateLocalStreams_w更新StreamParams信息
+- 通过ChannelManager找到对应的VoiceChannel或者VideoChannel
+- 通过VoiceChannel或者VideoChannel找到对应的MediaChannel然后执行AddSendStream或者RemoveSendStream
+- 创建WebRtcVideoSendStream，并且在构造的时候通过CreateAudioSendStream创建AudioSendStream
+- 针对AudioSendStream的所有操作都是通过WebRtcVideoSendStream完成的中转
+- AudioSendStream调用Start的时候会将自己添加到AudioState中
+
+# 采集数据和流的启动流程
+- AudioSendStream调用Start的时候会将自己添加到AudioState中
+- 当有流添加进来的时候，AudioState就会启动adm的采集
+- AudioState是VoiceEngine初始化Init的时候创建的，adm就是那个时候传进来的。
+- 当有流添加进来的时候AudioState会调用UpdateAudioTransportWithSendingStreams更新audio_transport_中的流
+- audio_transport_是AudioState创建的时候一起创建的，在构造中
+- AudioTransportImpl会更新audio_senders_成员，用与数据的发送
+- 数据的来源参考**音频数据流向**
+- AudioTransportImpl和AudioDevice的绑定关系是在VoiceEngine执行init的时候通过RegisterAudioCallback建立。
 
